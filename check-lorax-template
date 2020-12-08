@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+#
+# Output the package set that would be installed if the packages on the cmdline were installed
+#
+
+import argparse
+import os
+import sys
+import shutil
+import tempfile
+
+import dnf
+
+
+def setup_argparse():
+    parser = argparse.ArgumentParser(description="Check a lorax template package list")
+
+    # required arguments for image creation
+    required = parser.add_argument_group("required arguments")
+    required.add_argument("-r", "--release", help="release information", required=True, metavar="STRING")
+    required.add_argument("-s", "--source", help="source repository (may be listed multiple times)",
+                          metavar="REPOSITORY", action="append", default=[])
+    parser.add_argument("--skip-broken", help="Skip broken packages. This is the DNF default.",
+                        action="store_true", default=False)
+    parser.add_argument("--tempdir", help="Directory to store temporary DNF files")
+    parser.add_argument("--keep", action="store_true", help="Do not clean up temporary DNF files")
+    parser.add_argument("--proxy", help="Proxy URL to use for DNF")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("templatefile", help="Read packages from a Mako template file")
+
+    return parser
+
+
+def get_dbo(tempdir, repositories, releasever, best, proxy=None, verbose=False):
+    """ Create a dnf Base object and setup the repositories and installroot
+
+        :param list repositories: List of repositories to use for the installation
+        :param string releasever: Release version to pass to dnf
+
+    """
+    def sanitize_repo(repo):
+        """Convert bare paths to file:/// URIs, and silently reject protocols unhandled by yum"""
+        if repo.startswith("/"):
+            return "file://{0}".format(repo)
+
+        if any(repo.startswith(p) for p in ('http://', 'https://', 'ftp://', 'file://')):
+            return repo
+
+        return None
+
+    # sanitize the repository urls, split out .repo files
+    repo_urls = filter(None, [sanitize_repo(r) for r in repositories if not r.endswith(".repo")])
+    repo_files = list(r for r in repositories if r.endswith(".repo") and os.path.isfile(r))
+
+    cachedir = os.path.join(tempdir, "dnf.cache")
+    if not os.path.isdir(cachedir):
+        os.mkdir(cachedir)
+
+    logdir = os.path.join(tempdir, "dnf.logs")
+    if not os.path.isdir(logdir):
+        os.mkdir(logdir)
+
+    installroot = os.path.join(tempdir, "installroot")
+    if not os.path.isdir(installroot):
+        os.mkdir(installroot)
+
+    dnfbase = dnf.Base()
+    conf = dnfbase.conf
+    conf.best = best
+
+    # setup dirs.
+    conf.logdir = logdir
+    conf.cachedir = cachedir
+
+    # Turn off logging to the console
+    conf.debuglevel = 10
+    conf.errorlevel = 0
+    conf.debug_solver = True
+
+    conf.releasever = releasever
+    conf.installroot = installroot
+    conf.prepend_installroot('persistdir')
+    conf.tsflags.append('nodocs')
+
+    if proxy:
+        conf.proxy = proxy
+
+    # Add .repo files
+    if repo_files:
+        reposdir = os.path.join(tempdir, "dnf.repos")
+        if not os.path.isdir(reposdir):
+            os.mkdir(reposdir)
+        for r in repo_files:
+            shutil.copy2(r, reposdir)
+        conf.reposdir = [reposdir]
+        dnfbase.read_all_repos()
+
+    # add the repositories
+    for i, r in enumerate(repo_urls):
+        if "SRPM" in r or "srpm" in r:
+            if verbose:
+                print("Skipping source repo: %s" % r)
+            continue
+        repo_name = "lorax-repo-%d" % i
+        repo = dnf.repo.Repo(repo_name, conf)
+        repo.baseurl = [r]
+        repo.skip_if_unavailable = False
+        repo.enable()
+        dnfbase.repos.add(repo)
+        if verbose:
+            print("Added '%s': %s" % (repo_name, r))
+            print("Fetching metadata...")
+        try:
+            repo.load()
+        except dnf.exceptions.RepoError as e:
+            raise RuntimeError("Error fetching metadata for %s: %s" % (repo_name, e))
+
+    dnfbase.fill_sack(load_system_repo=False)
+    dnfbase.read_comps()
+
+    return dnfbase
+
+
+def mako_installpkg(pkg_file):
+    """ Read a Mako template file and return a list of all the packages
+        listed in the installpkg lines.
+    """
+    packages = []
+    with open(pkg_file, "r") as f:
+        for line in f.readlines():
+            if line.startswith("installpkg"):
+                packages += line.split()[1:]
+
+    return packages
+
+
+def depsolve(opts, packages):
+    tempdir = opts.tempdir or tempfile.mkdtemp(prefix="test-dnf.")
+    if opts.verbose:
+        print("Using tempdir: %s" % tempdir)
+
+    try:
+        dbo = get_dbo(tempdir, opts.source, opts.release, not opts.skip_broken, opts.proxy, opts.verbose)
+
+        if len(packages) == 0:
+            raise RuntimeError(f"No packages in {opts.templatefile}")
+
+        # Print all the packages DNF picks
+        missing = []
+        for pkg in packages:
+            if opts.verbose:
+                print("Adding %s to the transaction" % pkg)
+            try:
+                dbo.install(pkg)
+            except Exception as e:
+                missing += ["%s: %s" % (pkg, e)]
+
+        if missing:
+            raise RuntimeError(", ".join(missing))
+
+        try:
+            if opts.verbose:
+                print("Checking dependencies")
+            dbo.resolve()
+        except dnf.exceptions.DepsolveError as e:
+            raise RuntimeError(f"Dependency check failed: {e}")
+
+        if len(dbo.transaction) == 0:
+            raise RuntimeError("No packages in transaction")
+        if opts.verbose:
+            print("%d packages selected" % len(dbo.transaction))
+
+        # Print what DNF picked.
+        for pkg in sorted(dbo.transaction.install_set, key=lambda p: p.pkgtup[0]):
+            if opts.verbose:
+                print("%s - %s" % (pkg.repoid, pkg.pkgtup))
+            else:
+                print("-".join(pkg.pkgtup))
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    finally:
+        if not opts.keep and len(tempdir) > 5:
+            shutil.rmtree(tempdir)
+
+
+def main(opts):
+    packages = mako_installpkg(opts.templatefile)
+    if opts.source:
+        depsolve(opts, packages)
+    else:
+        # Just print the template package list
+        for p in sorted(set(packages)):
+            print(p)
+
+
+if __name__ == "__main__":
+    opts = setup_argparse().parse_args()
+    main(opts)
